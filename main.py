@@ -20,7 +20,7 @@ import io
 import json
 from typing import List, Optional
 
-   import pymupdf as fitz  # PyMuPDF — using the current import name
+import pymupdf as fitz  # PyMuPDF — using the current import name
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
