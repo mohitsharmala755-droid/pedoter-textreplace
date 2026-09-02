@@ -44,6 +44,15 @@ class Replacement(BaseModel):
     replace: str
 
 
+class SpanEdit(BaseModel):
+    page: int
+    bbox: List[float]  # [x0, y0, x1, y1] — exact position read from /extract
+    new_text: str
+    font: str
+    size: float
+    color: int
+
+
 def fit_font_size(text: str, fontname: str, original_size: float, max_width: float) -> float:
     """Shrink font size until `text` fits within `max_width`, down to a floor."""
     size = original_size
@@ -54,6 +63,91 @@ def fit_font_size(text: str, fontname: str, original_size: float, max_width: flo
             return size
         size -= 0.5
     return floor
+
+
+@app.post("/extract")
+async def extract_spans(file: UploadFile = File(...)):
+    """Read every text span in the PDF — exact position, font, size, color —
+    without modifying anything. The frontend uses this to render clickable
+    overlays directly on top of the real, rendered PDF page."""
+    pdf_bytes = await file.read()
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        raise HTTPException(400, "Could not open this file as a PDF")
+
+    pages_data = []
+    for page_index, page in enumerate(doc):
+        spans_data = []
+        for block in page.get_text("dict").get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    if not span["text"].strip():
+                        continue
+                    spans_data.append({
+                        "bbox": list(span["bbox"]),
+                        "text": span["text"],
+                        "font": span.get("font", "helv"),
+                        "size": span["size"],
+                        "color": span.get("color", 0),
+                    })
+        pages_data.append({
+            "page": page_index,
+            "width": page.rect.width,
+            "height": page.rect.height,
+            "spans": spans_data,
+        })
+    doc.close()
+    return {"pages": pages_data}
+
+
+@app.post("/replace-precise")
+async def replace_precise(file: UploadFile = File(...), edits: str = Form(...)):
+    """Apply exact edits at exact positions — each edit targets the precise
+    span the user clicked on (identified by page + bbox), not a text search.
+    This is what powers the click-on-the-word-you-see UX."""
+    try:
+        edit_list: List[SpanEdit] = [SpanEdit(**e) for e in json.loads(edits)]
+    except Exception:
+        raise HTTPException(400, "`edits` must be valid JSON matching the SpanEdit shape")
+
+    if not edit_list:
+        raise HTTPException(400, "Provide at least one edit")
+
+    pdf_bytes = await file.read()
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        raise HTTPException(400, "Could not open this file as a PDF")
+
+    for e in edit_list:
+        if e.page < 0 or e.page >= len(doc):
+            continue
+        page = doc[e.page]
+        rect = fitz.Rect(e.bbox)
+        color = (
+            ((e.color >> 16) & 255) / 255,
+            ((e.color >> 8) & 255) / 255,
+            (e.color & 255) / 255,
+        )
+        fitted_size = fit_font_size(e.new_text, e.font, e.size, rect.width)
+        page.add_redact_annot(
+            rect, text=e.new_text, fontname=e.font,
+            fontsize=fitted_size, text_color=color, align=fitz.TEXT_ALIGN_LEFT,
+        )
+
+    for page in doc:
+        page.apply_redactions()
+
+    out = io.BytesIO()
+    doc.save(out)
+    doc.close()
+    out.seek(0)
+
+    return StreamingResponse(
+        out, media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=replaced.pdf"},
+    )
 
 
 @app.post("/replace")
