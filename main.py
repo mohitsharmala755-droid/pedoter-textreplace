@@ -109,20 +109,30 @@ async def extract_spans(file: UploadFile = File(...)):
                 spans = [s for s in line.get("spans", []) if s["text"].strip()]
                 if not spans:
                     continue
-                # Merge text left-to-right; use the FIRST span's style for the
-                # whole line (matches how the line reads visually as one unit).
+                # Merge text left-to-right. Use whichever (font, size, color)
+                # combination covers the MOST characters in the line to
+                # represent the whole thing — using the first span's style
+                # broke when that first fragment wasn't representative of
+                # the line's real, dominant appearance (e.g. it picked up a
+                # stray/differently-styled leading character run).
                 text = "".join(s["text"] for s in spans)
                 x0 = min(s["bbox"][0] for s in spans)
                 y0 = min(s["bbox"][1] for s in spans)
                 x1 = max(s["bbox"][2] for s in spans)
                 y1 = max(s["bbox"][3] for s in spans)
-                primary = spans[0]
+
+                style_weight = {}
+                for s in spans:
+                    key = (s.get("font", "helv"), s["size"], s.get("color", 0))
+                    style_weight[key] = style_weight.get(key, 0) + len(s["text"])
+                dominant_font, dominant_size, dominant_color = max(style_weight, key=style_weight.get)
+
                 lines_data.append({
                     "bbox": [x0, y0, x1, y1],
                     "text": text,
-                    "font": primary.get("font", "helv"),
-                    "size": primary["size"],
-                    "color": primary.get("color", 0),
+                    "font": dominant_font,
+                    "size": dominant_size,
+                    "color": dominant_color,
                 })
         pages_data.append({
             "page": page_index,
