@@ -84,9 +84,17 @@ def lines_needed(text: str, fontname: str, size: float, max_width: float) -> int
 
 @app.post("/extract")
 async def extract_spans(file: UploadFile = File(...)):
-    """Read every text span in the PDF — exact position, font, size, color —
+    """Read every text LINE in the PDF — exact position, font, size, color —
     without modifying anything. The frontend uses this to render clickable
-    overlays directly on top of the real, rendered PDF page."""
+    overlays directly on top of the real, rendered PDF page.
+
+    Important: PDFs frequently split one visual line into several internal
+    'spans' (a generation quirk, invisible to the eye — e.g. kerning pairs,
+    minor font-metric differences). Exposing those raw spans as separate
+    click targets caused replaced text to come out in mismatched colors/sizes
+    when a user's edit spanned more than one underlying span. Merging spans
+    into whole lines (using the line's most common style) fixes that — a
+    user clicks what looks like one line of text and it behaves like one."""
     pdf_bytes = await file.read()
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -95,24 +103,32 @@ async def extract_spans(file: UploadFile = File(...)):
 
     pages_data = []
     for page_index, page in enumerate(doc):
-        spans_data = []
+        lines_data = []
         for block in page.get_text("dict").get("blocks", []):
             for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    if not span["text"].strip():
-                        continue
-                    spans_data.append({
-                        "bbox": list(span["bbox"]),
-                        "text": span["text"],
-                        "font": span.get("font", "helv"),
-                        "size": span["size"],
-                        "color": span.get("color", 0),
-                    })
+                spans = [s for s in line.get("spans", []) if s["text"].strip()]
+                if not spans:
+                    continue
+                # Merge text left-to-right; use the FIRST span's style for the
+                # whole line (matches how the line reads visually as one unit).
+                text = "".join(s["text"] for s in spans)
+                x0 = min(s["bbox"][0] for s in spans)
+                y0 = min(s["bbox"][1] for s in spans)
+                x1 = max(s["bbox"][2] for s in spans)
+                y1 = max(s["bbox"][3] for s in spans)
+                primary = spans[0]
+                lines_data.append({
+                    "bbox": [x0, y0, x1, y1],
+                    "text": text,
+                    "font": primary.get("font", "helv"),
+                    "size": primary["size"],
+                    "color": primary.get("color", 0),
+                })
         pages_data.append({
             "page": page_index,
             "width": page.rect.width,
             "height": page.rect.height,
-            "spans": spans_data,
+            "spans": lines_data,
         })
     doc.close()
     return {"pages": pages_data}
