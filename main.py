@@ -54,15 +54,32 @@ class SpanEdit(BaseModel):
 
 
 def fit_font_size(text: str, fontname: str, original_size: float, max_width: float) -> float:
-    """Shrink font size until `text` fits within `max_width`, down to a floor."""
+    """Shrink font size only as a last resort — mild shrink (down to 90% of
+    original) if the text is just slightly too wide for one line."""
     size = original_size
-    floor = original_size * FONT_SIZE_FLOOR_RATIO
+    floor = original_size * 0.9
     while size > floor:
         width = fitz.get_text_length(text, fontname=fontname, fontsize=size)
         if width <= max_width:
             return size
         size -= 0.5
     return floor
+
+
+def lines_needed(text: str, fontname: str, size: float, max_width: float) -> int:
+    """How many lines this text needs to wrap into at this size/width —
+    a simple word-wrap simulation matching how add_redact_annot wraps text."""
+    words = text.split(" ")
+    lines = 1
+    current = ""
+    for word in words:
+        candidate = (current + " " + word).strip()
+        if fitz.get_text_length(candidate, fontname=fontname, fontsize=size) <= max_width:
+            current = candidate
+        else:
+            lines += 1
+            current = word
+    return max(lines, 1)
 
 
 @app.post("/extract")
@@ -105,7 +122,12 @@ async def extract_spans(file: UploadFile = File(...)):
 async def replace_precise(file: UploadFile = File(...), edits: str = Form(...)):
     """Apply exact edits at exact positions — each edit targets the precise
     span the user clicked on (identified by page + bbox), not a text search.
-    This is what powers the click-on-the-word-you-see UX."""
+    This is what powers the click-on-the-word-you-see UX.
+
+    Replacement text longer than the original word/phrase grows the box
+    DOWNWARD (adding lines) rather than shrinking the font — so a short
+    original word replaced with a full sentence still reads at a normal,
+    matching size instead of becoming tiny."""
     try:
         edit_list: List[SpanEdit] = [SpanEdit(**e) for e in json.loads(edits)]
     except Exception:
@@ -131,6 +153,14 @@ async def replace_precise(file: UploadFile = File(...), edits: str = Form(...)):
             (e.color & 255) / 255,
         )
         fitted_size = fit_font_size(e.new_text, e.font, e.size, rect.width)
+        n_lines = lines_needed(e.new_text, e.font, fitted_size, rect.width)
+        line_height = fitted_size * 1.25
+        needed_height = n_lines * line_height
+        if needed_height > rect.height:
+            # Grow the box downward so extra lines don't overlap content below —
+            # this is the key fix: wrap onto more lines instead of shrinking text.
+            rect = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + needed_height)
+
         page.add_redact_annot(
             rect, text=e.new_text, fontname=e.font,
             fontsize=fitted_size, text_color=color, align=fitz.TEXT_ALIGN_LEFT,
