@@ -168,6 +168,8 @@ async def replace_precise(file: UploadFile = File(...), edits: str = Form(...)):
     except Exception:
         raise HTTPException(400, "Could not open this file as a PDF")
 
+    pending_text_draws = []  # (page_index, rect, text, fontname, fontsize, color)
+
     for e in edit_list:
         if e.page < 0 or e.page >= len(doc):
             continue
@@ -183,17 +185,37 @@ async def replace_precise(file: UploadFile = File(...), edits: str = Form(...)):
         line_height = fitted_size * 1.25
         needed_height = n_lines * line_height
         if needed_height > rect.height:
-            # Grow the box downward so extra lines don't overlap content below —
-            # this is the key fix: wrap onto more lines instead of shrinking text.
+            # Grow the box downward so extra lines don't overlap content below.
             rect = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + needed_height)
 
-        page.add_redact_annot(
-            rect, text=e.new_text, fontname=e.font,
-            fontsize=fitted_size, text_color=color, align=fitz.TEXT_ALIGN_LEFT,
-        )
+        # Step 1: mark the ORIGINAL area for erasure only — no text yet.
+        # (add_redact_annot's own `text` parameter is built for short, single-
+        # line redaction labels and does not reliably wrap long text across
+        # multiple lines regardless of rect height — that was the actual bug.)
+        page.add_redact_annot(rect, fill=(1, 1, 1))
+        pending_text_draws.append((e.page, rect, e.new_text, e.font, fitted_size, color))
 
+    # Apply every erasure first, across the whole document.
     for page in doc:
         page.apply_redactions()
+
+    # Step 2: draw each replacement using insert_textbox — PyMuPDF's actual
+    # word-wrapping text box function — into the (possibly enlarged) rect.
+    # insert_textbox returns a negative number if the text still didn't fit —
+    # in that case, grow the box once more and retry rather than silently
+    # cutting text off.
+    for page_index, rect, text, fontname, fontsize, color in pending_text_draws:
+        page = doc[page_index]
+        overflow = page.insert_textbox(
+            rect, text, fontname=fontname, fontsize=fontsize,
+            color=color, align=fitz.TEXT_ALIGN_LEFT,
+        )
+        if overflow < 0:
+            taller_rect = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y1 + abs(overflow) + fontsize)
+            page.insert_textbox(
+                taller_rect, text, fontname=fontname, fontsize=fontsize,
+                color=color, align=fitz.TEXT_ALIGN_LEFT,
+            )
 
     out = io.BytesIO()
     doc.save(out)
